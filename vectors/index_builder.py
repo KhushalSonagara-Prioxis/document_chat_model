@@ -47,6 +47,9 @@ def _chunk_and_metadata_from_pdf_bytes(pdf_filename_only: str, pdf_bytes: bytes)
         f.write(pdf_bytes)
 
     raw_text = read_pdf_text(tmp_path)
+    if not raw_text:
+        return [], []
+
     chunks = split_text(raw_text)
 
     metadatas = []
@@ -76,15 +79,18 @@ def load_pdf_chunk_map():
         data = download_blob(f"{INDEX_FOLDER}{PDF_CHUNK_MAP_FILE}")
         return pickle.loads(data)
     except Exception:
+        # Return empty map if file missing or corrupt
         return {}
 
 # -------------------------------
 # Save PDF → chunk map
 # -------------------------------
 def save_pdf_chunk_map(pdf_chunk_map):
-    data = pickle.dumps(pdf_chunk_map)
-    # Save to INDEX_FOLDER
-    upload_blob(f"{INDEX_FOLDER}{PDF_CHUNK_MAP_FILE}", data)
+    try:
+        data = pickle.dumps(pdf_chunk_map)
+        upload_blob(f"{INDEX_FOLDER}{PDF_CHUNK_MAP_FILE}", data)
+    except Exception as e:
+        logger.error(f"Failed to save PDF chunk map: {e}")
 
 # -------------------------------
 # Clear FAISS
@@ -102,8 +108,10 @@ def _clear_faiss_store():
             delete_blob(f"{INDEX_FOLDER}{blob_file}")
         except Exception:
             pass
-    global _cached_store
-    _cached_store = None
+            
+    # Reset Cache
+    from vectors.vector_service import clear_cache
+    clear_cache()
     logger.info("FAISS store cleared in %s.", INDEX_FOLDER)
 
 # -------------------------------
@@ -112,166 +120,178 @@ def _clear_faiss_store():
 def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
     """
     Incrementally add new PDFs to FAISS and BM25.
-    new_pdfs: List of filenames (e.g., ['file1.pdf']), NOT paths.
     """
     logger.info("Starting FAISS rebuild/incremental update...")
 
-    # 1. List only files in the PDF_FOLDER
-    all_blobs = list_blobs(prefix=PDF_FOLDER)
-    pdf_files_full_paths = [b for b in all_blobs if b.lower().endswith(".pdf")]
-
-    # 2. Filter logic: Match just the filename part
-    # pdf_files_full_paths contains ['pdfs/a.pdf', 'pdfs/b.pdf']
-    if new_pdfs:
-        # Create a set of expected full paths: {'pdfs/new.pdf'}
-        target_paths = set(f"{PDF_FOLDER}{p}" for p in new_pdfs)
-        pdf_files_to_process = [p for p in pdf_files_full_paths if p in target_paths]
-    else:
-        pdf_files_to_process = pdf_files_full_paths
-
-    if not pdf_files_to_process:
-        logger.info("No PDFs found to process.")
-        if not pdf_files_full_paths:
-             # Only clear if NO PDFs exist at all in storage
-            _clear_faiss_store()
-            return "FAISS cleared; no PDFs found."
-        return "No new PDFs to add."
-
-    embeddings = get_embeddings()
-    local_dir = "/tmp/faiss_store"
-    os.makedirs(local_dir, exist_ok=True)
-
-    # Load existing FAISS store from INDEX_FOLDER
-    store = None
-    existing_ids = set()
-    pdf_chunk_map = load_pdf_chunk_map() if not rebuild_all else {}
-
     try:
-        # Check if index file exists in local temp (downloaded via load_faiss or previous step)
-        # For simplicity, we assume we might need to fetch it if not in memory, 
-        # but normally load_faiss handles the download.
-        # Here we try to load what is currently in blob if we don't have it.
-        if os.path.exists(os.path.join(local_dir, FAISS_STORE_FILE)):
-            store = FAISS.load_local(local_dir, embeddings, allow_dangerous_deserialization=True)
-            existing_ids = set(store.docstore._dict.keys())
-            logger.info("Existing FAISS store loaded for incremental update.")
+        # 1. List only files in the PDF_FOLDER
+        all_blobs = list_blobs(prefix=PDF_FOLDER)
+        pdf_files_full_paths = [b for b in all_blobs if b.lower().endswith(".pdf")]
+
+        # Handle Empty Storage Case
+        if not pdf_files_full_paths:
+             logger.info("No PDFs found in storage. Clearing index.")
+             _clear_faiss_store()
+             return "Index cleared (Storage is empty)."
+
+        # 2. Filter logic
+        pdf_files_to_process = []
+        if new_pdfs:
+            target_paths = set(f"{PDF_FOLDER}{p}" for p in new_pdfs)
+            pdf_files_to_process = [p for p in pdf_files_full_paths if p in target_paths]
         else:
-            # Try loading via service to fetch from blob
-            from vectors.vector_service import load_faiss
-            store = load_faiss()
-            if store:
-                existing_ids = set(store.docstore._dict.keys())
-    except Exception:
-        logger.info("No existing FAISS store found; starting fresh.")
-        pdf_chunk_map = {}
+            pdf_files_to_process = pdf_files_full_paths
 
-    documents_to_add = []
+        if not pdf_files_to_process:
+            return "No matching PDFs found to process."
 
-    for pdf_full_path in pdf_files_to_process:
-        logger.info("Processing PDF: %s", pdf_full_path)
-        stream = download_blob(pdf_full_path)
+        embeddings = get_embeddings()
+        local_dir = "/tmp/faiss_store"
+        os.makedirs(local_dir, exist_ok=True)
+
+        # Load existing FAISS store
+        store = None
+        existing_ids = set()
+        pdf_chunk_map = load_pdf_chunk_map() if not rebuild_all else {}
+
+        if not rebuild_all:
+            try:
+                # Try loading via service to fetch from blob
+                from vectors.vector_service import load_faiss
+                store = load_faiss()
+                if store:
+                    existing_ids = set(store.docstore._dict.keys())
+            except Exception:
+                logger.info("No existing FAISS store found; starting fresh.")
+                pdf_chunk_map = {}
+        else:
+            pdf_chunk_map = {}
+
+        documents_to_add = []
+        errors = []
+
+        # --- PROCESS FILES ---
+        for pdf_full_path in pdf_files_to_process:
+            try:
+                logger.info("Processing PDF: %s", pdf_full_path)
+                stream = download_blob(pdf_full_path)
+                
+                clean_filename = os.path.basename(pdf_full_path)
+                
+                texts, metadatas = _chunk_and_metadata_from_pdf_bytes(clean_filename, stream)
+
+                new_ids = []
+                for i, (t, m) in enumerate(zip(texts, metadatas)):
+                    uid = f"{clean_filename}_{i}"
+                    # Skip duplicates
+                    if uid in existing_ids or not t.strip():
+                        continue
+                    existing_ids.add(uid)
+                    new_ids.append(uid)
+                    doc = Document(page_content=t, metadata=m, id=uid)
+                    documents_to_add.append(doc)
+
+                if new_ids:
+                    pdf_chunk_map[clean_filename] = pdf_chunk_map.get(clean_filename, []) + new_ids
+
+            except Exception as e:
+                logger.error(f"Failed to process PDF {pdf_full_path}: {e}")
+                errors.append(f"{pdf_full_path}: {str(e)}")
+                continue # Skip bad file and continue
+
+        if not documents_to_add and store is None:
+            _clear_faiss_store()
+            return "No new chunks added (files already indexed or all corrupt)."
+
+        # Initialize or add to FAISS
+        if documents_to_add:
+            if store is None:
+                store = FAISS.from_documents(documents_to_add, embedding=embeddings)
+                logger.info("FAISS initialized with %d chunks.", len(documents_to_add))
+            else:
+                store.add_documents(documents_to_add)
+                logger.info("Incrementally added %d new chunks to FAISS.", len(documents_to_add))
+        else:
+            logger.info("No new chunks to add; FAISS store unchanged.")
+
+        # Save FAISS locally then upload
+        store.save_local(local_dir)
+        try:
+            with open(os.path.join(local_dir, FAISS_INDEX_FILE), "rb") as f_idx:
+                upload_blob(f"{INDEX_FOLDER}{FAISS_INDEX_FILE}", f_idx.read())
+            with open(os.path.join(local_dir, FAISS_STORE_FILE), "rb") as f_pkl:
+                upload_blob(f"{INDEX_FOLDER}{FAISS_STORE_FILE}", f_pkl.read())
+        except Exception as e:
+            raise RuntimeError(f"Failed to upload index files to blob: {e}")
+
+        # Rebuild BM25
+        try:
+            all_docs = list(store.docstore._dict.values())
+            if all_docs:
+                all_texts = [d.page_content for d in all_docs]
+                all_doc_ids = [d.id for d in all_docs]
+                bm25, corpus = build_bm25_corpus(all_texts)
+                
+                bm25_pickle_path = os.path.join(local_dir, BM25_FILE)
+                with open(bm25_pickle_path, "wb") as f:
+                    pickle.dump({
+                        "bm25": bm25,
+                        "corpus": corpus,
+                        "doc_ids": all_doc_ids
+                    }, f)
+                with open(bm25_pickle_path, "rb") as f:
+                    upload_blob(f"{INDEX_FOLDER}{BM25_FILE}", f.read())
+        except Exception as e:
+            logger.error(f"BM25 rebuild failed: {e}")
+
+        # Save map
+        save_pdf_chunk_map(pdf_chunk_map)
         
-        # Strip "pdfs/" from name to use as clean ID/Source
-        clean_filename = os.path.basename(pdf_full_path)
-        
-        texts, metadatas = _chunk_and_metadata_from_pdf_bytes(clean_filename, stream)
+        result_msg = "FAISS + BM25 updated."
+        if errors:
+            result_msg += f" (Note: {len(errors)} files failed to process)."
+        return result_msg
 
-        new_ids = []
-        for i, (t, m) in enumerate(zip(texts, metadatas)):
-            # Create deterministic ID based on clean filename
-            uid = f"{clean_filename}_{i}"
-            if uid in existing_ids or not t.strip():
-                continue
-            existing_ids.add(uid)
-            new_ids.append(uid)
-            doc = Document(page_content=t, metadata=m, id=uid)
-            documents_to_add.append(doc)
-
-        if new_ids:
-            pdf_chunk_map[clean_filename] = pdf_chunk_map.get(clean_filename, []) + new_ids
-
-    if not documents_to_add and store is None:
-        _clear_faiss_store()
-        # It's possible we just processed files that were already indexed
-        return "No new chunks added (files already indexed)."
-
-    # Initialize or add to FAISS
-    if store is None and documents_to_add:
-        store = FAISS.from_documents(documents_to_add[:1], embedding=embeddings)
-        if len(documents_to_add) > 1:
-            store.add_documents(documents_to_add[1:])
-        logger.info("FAISS initialized with %d chunks.", len(documents_to_add))
-    elif documents_to_add:
-        store.add_documents(documents_to_add)
-        logger.info("Incrementally added %d new chunks to FAISS.", len(documents_to_add))
-    else:
-        logger.info("No new chunks to add; FAISS store unchanged.")
-
-    # Save FAISS locally then upload to INDEX_FOLDER
-    store.save_local(local_dir)
-    with open(os.path.join(local_dir, FAISS_INDEX_FILE), "rb") as f_idx:
-        upload_blob(f"{INDEX_FOLDER}{FAISS_INDEX_FILE}", f_idx.read())
-    with open(os.path.join(local_dir, FAISS_STORE_FILE), "rb") as f_pkl:
-        upload_blob(f"{INDEX_FOLDER}{FAISS_STORE_FILE}", f_pkl.read())
-
-    # Rebuild BM25 from entire FAISS store
-    all_docs = list(store.docstore._dict.values())
-    if all_docs:
-        all_texts = [d.page_content for d in all_docs]
-        all_doc_ids = [d.id for d in all_docs]
-        bm25, corpus = build_bm25_corpus(all_texts)
-        bm25_pickle_path = os.path.join(local_dir, BM25_FILE)
-        with open(bm25_pickle_path, "wb") as f:
-            pickle.dump({
-                "bm25": bm25,
-                "corpus": corpus,
-                "doc_ids": all_doc_ids
-            }, f)
-        with open(bm25_pickle_path, "rb") as f:
-            upload_blob(f"{INDEX_FOLDER}{BM25_FILE}", f.read())
-        logger.info("BM25 index rebuilt successfully with %d chunks.", len(all_texts))
-
-    # Save updated PDF → chunk map
-    save_pdf_chunk_map(pdf_chunk_map)
-    logger.info("Updated PDF → chunk map saved.")
-    
-    return "FAISS + BM25 rebuilt successfully"
+    except Exception as e:
+        logger.critical(f"Critical error in rebuild_faiss: {e}", exc_info=True)
+        raise RuntimeError(f"Index rebuild failed: {e}")
 
 # -------------------------------
 # Delete PDF chunks from FAISS
 # -------------------------------
 def delete_pdf_from_faiss(pdf_filename_only: str):
-    """
-    pdf_filename_only: 'file.pdf' (no folder path)
-    """
-    from .vector_service import clear_cache
+    try:
+        from .vector_service import clear_cache
 
-    store = load_faiss()
-    if not store:
-        return
+        store = load_faiss()
+        if not store:
+            return
 
-    # IDs are stored as "filename.pdf_1", so we search for that prefix
-    ids_to_delete = [doc_id for doc_id in store.docstore._dict.keys()
-                     if doc_id.startswith(pdf_filename_only + "_")]
+        ids_to_delete = [doc_id for doc_id in store.docstore._dict.keys()
+                         if doc_id.startswith(pdf_filename_only + "_")]
 
-    if ids_to_delete:
-        store.delete(ids_to_delete)
+        if ids_to_delete:
+            store.delete(ids_to_delete)
 
-        local_dir = "/tmp/faiss_store"
-        os.makedirs(local_dir, exist_ok=True)
-        store.save_local(local_dir)
+            local_dir = "/tmp/faiss_store"
+            os.makedirs(local_dir, exist_ok=True)
+            store.save_local(local_dir)
 
-        # Upload updated FAISS to INDEX_FOLDER
-        with open(os.path.join(local_dir, FAISS_INDEX_FILE), "rb") as f_idx:
-            upload_blob(f"{INDEX_FOLDER}{FAISS_INDEX_FILE}", f_idx.read())
-        with open(os.path.join(local_dir, FAISS_STORE_FILE), "rb") as f_pkl:
-            upload_blob(f"{INDEX_FOLDER}{FAISS_STORE_FILE}", f_pkl.read())
+            # Upload updated FAISS
+            with open(os.path.join(local_dir, FAISS_INDEX_FILE), "rb") as f_idx:
+                upload_blob(f"{INDEX_FOLDER}{FAISS_INDEX_FILE}", f_idx.read())
+            with open(os.path.join(local_dir, FAISS_STORE_FILE), "rb") as f_pkl:
+                upload_blob(f"{INDEX_FOLDER}{FAISS_STORE_FILE}", f_pkl.read())
 
-        clear_cache()
-        logger.info("Deleted %d chunks for PDF '%s'", len(ids_to_delete), pdf_filename_only)
+            clear_cache()
+            logger.info("Deleted %d chunks for PDF '%s'", len(ids_to_delete), pdf_filename_only)
 
-    # Remove from PDF → chunk map
-    pdf_chunk_map = load_pdf_chunk_map()
-    if pdf_filename_only in pdf_chunk_map:
-        del pdf_chunk_map[pdf_filename_only]
-        save_pdf_chunk_map(pdf_chunk_map)
+        # Remove from map
+        pdf_chunk_map = load_pdf_chunk_map()
+        if pdf_filename_only in pdf_chunk_map:
+            del pdf_chunk_map[pdf_filename_only]
+            save_pdf_chunk_map(pdf_chunk_map)
+
+    except Exception as e:
+        logger.error(f"Error deleting PDF from FAISS: {e}")
+        # Don't raise, just log, so we don't block the file deletion in main.py
