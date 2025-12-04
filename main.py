@@ -9,7 +9,8 @@ import uuid
 import asyncio
 
 from blob.blob_utils import upload_blob, list_blobs, delete_blob
-from vectors.index_builder import rebuild_faiss, delete_pdf_from_faiss, load_pdf_chunk_map, save_pdf_chunk_map
+# Added _clear_faiss_store to imports to handle full index deletion
+from vectors.index_builder import rebuild_faiss, delete_pdf_from_faiss, load_pdf_chunk_map, save_pdf_chunk_map, _clear_faiss_store
 from vectors.vector_service import load_faiss, hybrid_search, clear_cache 
 from ml.chat_model import get_chat_model
 from config import MODEL_INPUT_PRICE, MODEL_OUTPUT_PRICE, PDF_FOLDER, INDEX_FOLDER, FAISS_INDEX_FILE, FAISS_STORE_FILE, BM25_FILE, PDF_CHUNK_MAP_FILE
@@ -126,13 +127,17 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
 def list_files():
     try:
         full_paths = list_blobs(prefix=PDF_FOLDER)
-        return [os.path.basename(path) for path in full_paths]
+        filenames = [os.path.basename(path) for path in full_paths if path.lower().endswith(".pdf")]
+        
+        return {
+            "count": len(filenames),
+            "files": filenames
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
 
-
 # -------------------------------
-# Delete PDF
+# Delete PDF (Single)
 # -------------------------------
 @app.delete("/delete/{filename}")
 async def delete_pdf(filename: str):
@@ -155,15 +160,7 @@ async def delete_pdf(filename: str):
             
             if not remaining_pdfs:
                 logger.info("No PDFs remaining; cleaning up Index.")
-                # Local cleanup
-                faiss_dir = "/tmp/faiss_store"
-                if os.path.exists(faiss_dir):
-                    import shutil
-                    shutil.rmtree(faiss_dir)
-                # Blob cleanup
-                for blob_file in [FAISS_INDEX_FILE, FAISS_STORE_FILE, BM25_FILE, PDF_CHUNK_MAP_FILE]:
-                    delete_blob(f"{INDEX_FOLDER}{blob_file}")
-                
+                _clear_faiss_store()
                 clear_cache()
 
         return {"message": f"Deleted '{filename}' successfully."}
@@ -173,6 +170,55 @@ async def delete_pdf(filename: str):
     except Exception as e:
         logger.error("Error deleting PDF: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------
+# Delete ALL Files (Reset)
+# -------------------------------
+@app.delete("/delete-all")
+async def delete_all_files():
+    """
+    Deletes ALL PDFs and wipes the Vector Index and Cache completely.
+    """
+    try:
+        deleted_count = 0
+        
+        # 1. List all PDFs in the PDF folder
+        all_pdfs = list_blobs(prefix=PDF_FOLDER)
+        
+        # 2. Delete each PDF blob
+        for pdf_path in all_pdfs:
+            try:
+                delete_blob(pdf_path)
+                deleted_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete individual blob {pdf_path}: {e}")
+
+        async with faiss_lock:
+            # 3. Wipe the FAISS/BM25 Index and Chunk Map from Blob Storage & Local Temp
+            # This function (imported from index_builder) handles all index files cleanup
+            _clear_faiss_store()
+            
+            # 4. Clear In-Memory Cache
+            clear_cache()
+            
+            # 5. Clear Chat History (optional, but logical since knowledge is gone)
+            conversation_history.clear()
+
+        logger.info(f"System Reset: Deleted {deleted_count} documents and cleared indices.")
+        
+        return {
+            "message": "System reset successful.",
+            "details": {
+                "deleted_files_count": deleted_count,
+                "index_status": "Cleared",
+                "cache_status": "Cleared"
+            }
+        }
+
+    except Exception as e:
+        logger.error("Critical error in delete-all: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"System reset failed: {str(e)}")
 
 
 # -------------------------------
@@ -194,15 +240,17 @@ async def ask(body: AskRequest):
     try:
         store = load_faiss()
         
-        # --- Handle Empty Store / First Run ---
+        # --- Handle Missing Index / First Run ---
         if not store:
+            logger.info("Index not found in memory or storage. Attempting auto-recovery.")
             async with faiss_lock:
                 try:
-                    # Attempt to rebuild if files exist but index is missing
+                    # rebuild_faiss will check for PDFs inside the function
                     rebuild_msg = rebuild_faiss()
                     
-                    if "Index cleared" in rebuild_msg:
-                        # Means no PDFs were found in storage
+                    if "EMPTY_STORAGE" in rebuild_msg or "Index cleared" in rebuild_msg:
+                        # CASE: Index missing AND No PDFs in Blob -> Clean 404
+                        logger.warning("Auto-recovery failed: No documents found in storage.")
                         return JSONResponse(
                             status_code=404, 
                             content={
@@ -212,14 +260,14 @@ async def ask(body: AskRequest):
                             }
                         )
                     
-                    # Retry loading after rebuild
+                    # CASE: Index was missing, but PDFs existed -> Rebuilt -> Load again
                     store = load_faiss()
                 except Exception as e:
-                    logger.error("Auto-rebuild failed: %s", e)
-                    raise HTTPException(status_code=500, detail="Knowledge base unavailable.")
+                    logger.error("Auto-recovery critical failure: %s", e)
+                    raise HTTPException(status_code=500, detail="Knowledge base unavailable and recovery failed.")
 
         if not store:
-             # If still None, something is wrong
+             # If still None after recovery attempt, something is technically wrong
              raise HTTPException(status_code=500, detail="Failed to load knowledge base.")
 
         # --- Search & Generate ---
@@ -251,6 +299,12 @@ Instructions:
 5. **Format:** - Use **Markdown Tables** for comparisons.
    - Use bullet points for lists.
 6. **Context:** Use **Chat History** to understand follow-up questions.
+
+==========================
+STRICT RESPONSE RULES
+==========================
+Cite specific all files name used in new line. Don't add not chunk number.
+e.g. "(source: Files Name)"
 
 ==========================
 CONVERSATION HISTORY

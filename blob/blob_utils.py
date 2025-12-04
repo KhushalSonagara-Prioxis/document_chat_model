@@ -16,7 +16,6 @@ try:
     container = blob_client.get_container_client(AZURE_CONTAINER_NAME)
 except Exception as e:
     logger.critical(f"Failed to initialize Azure Blob Client: {e}")
-    # We raise here because the app cannot function without storage
     raise
 
 # ---------------------------------------------------
@@ -49,12 +48,16 @@ def download_blob(filename: str) -> bytes:
     try:
         blob = container.get_blob_client(filename)
         if not blob.exists():
-            # Standardize the error for the caller
+            # triggers the FileNotFoundError block below
             raise FileNotFoundError(f"Blob not found in Azure: {filename}")
         return blob.download_blob().readall()
+
+    except FileNotFoundError:
+        logger.info(f"Blob requested but not found: {filename}")
+        raise 
         
     except ResourceNotFoundError:
-        logger.warning(f"Blob {filename} does not exist.")
+        logger.warning(f"Blob {filename} does not exist (ResourceNotFound).")
         raise FileNotFoundError(f"Blob not found: {filename}")
     except AzureError as e:
         logger.error(f"Azure Download Failed for {filename}: {e}")

@@ -132,7 +132,8 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
         if not pdf_files_full_paths:
              logger.info("No PDFs found in storage. Clearing index.")
              _clear_faiss_store()
-             return "Index cleared (Storage is empty)."
+             # Return a specific flag string
+             return "EMPTY_STORAGE"
 
         # 2. Filter logic
         pdf_files_to_process = []
@@ -156,7 +157,6 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
 
         if not rebuild_all:
             try:
-                # Try loading via service to fetch from blob
                 from vectors.vector_service import load_faiss
                 store = load_faiss()
                 if store:
@@ -197,11 +197,11 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
             except Exception as e:
                 logger.error(f"Failed to process PDF {pdf_full_path}: {e}")
                 errors.append(f"{pdf_full_path}: {str(e)}")
-                continue # Skip bad file and continue
+                continue 
 
         if not documents_to_add and store is None:
             _clear_faiss_store()
-            return "No new chunks added (files already indexed or all corrupt)."
+            return "EMPTY_STORAGE" # Fallback if everything was corrupt
 
         # Initialize or add to FAISS
         if documents_to_add:
@@ -244,7 +244,6 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
         except Exception as e:
             logger.error(f"BM25 rebuild failed: {e}")
 
-        # Save map
         save_pdf_chunk_map(pdf_chunk_map)
         
         result_msg = "FAISS + BM25 updated."
