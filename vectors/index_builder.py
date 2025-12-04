@@ -23,6 +23,11 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # -------------------------------
+# Constants
+# -------------------------------
+BATCH_SIZE = 3  # Process 3 files at a time
+
+# -------------------------------
 # Deterministic doc ID
 # -------------------------------
 def _hash_text(t: str) -> str:
@@ -60,6 +65,10 @@ def _chunk_and_metadata_from_pdf_bytes(pdf_filename_only: str, pdf_bytes: bytes)
             "chunk_hash": _hash_text(c),
             "text": c
         })
+    # clean up temp file
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+        
     return chunks, metadatas
 
 # -------------------------------
@@ -119,7 +128,7 @@ def _clear_faiss_store():
 # -------------------------------
 def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
     """
-    Incrementally add new PDFs to FAISS and BM25.
+    Incrementally add new PDFs to FAISS and BM25 in batches.
     """
     logger.info("Starting FAISS rebuild/incremental update...")
 
@@ -132,7 +141,6 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
         if not pdf_files_full_paths:
              logger.info("No PDFs found in storage. Clearing index.")
              _clear_faiss_store()
-             # Return a specific flag string
              return "EMPTY_STORAGE"
 
         # 2. Filter logic
@@ -150,7 +158,7 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
         local_dir = "/tmp/faiss_store"
         os.makedirs(local_dir, exist_ok=True)
 
-        # Load existing FAISS store
+        # Load existing FAISS store (if any)
         store = None
         existing_ids = set()
         pdf_chunk_map = load_pdf_chunk_map() if not rebuild_all else {}
@@ -167,52 +175,64 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
         else:
             pdf_chunk_map = {}
 
-        documents_to_add = []
+        total_files = len(pdf_files_to_process)
         errors = []
+        chunks_added_total = 0
 
-        # --- PROCESS FILES ---
-        for pdf_full_path in pdf_files_to_process:
-            try:
-                logger.info("Processing PDF: %s", pdf_full_path)
-                stream = download_blob(pdf_full_path)
+        # --- BATCH PROCESSING LOOP ---
+        # Slicing [i : i+3] safely handles cases where remaining files < 3
+        for i in range(0, total_files, BATCH_SIZE):
+            batch_files = pdf_files_to_process[i : i + BATCH_SIZE]
+            batch_documents = []
+            
+            logger.info(f"Processing Batch {i//BATCH_SIZE + 1}: {len(batch_files)} files...")
+
+            for pdf_full_path in batch_files:
+                try:
+                    stream = download_blob(pdf_full_path)
+                    clean_filename = os.path.basename(pdf_full_path)
+                    
+                    texts, metadatas = _chunk_and_metadata_from_pdf_bytes(clean_filename, stream)
+
+                    new_ids = []
+                    for k, (t, m) in enumerate(zip(texts, metadatas)):
+                        uid = f"{clean_filename}_{k}"
+                        # Skip duplicates
+                        if uid in existing_ids or not t.strip():
+                            continue
+                        existing_ids.add(uid)
+                        new_ids.append(uid)
+                        doc = Document(page_content=t, metadata=m, id=uid)
+                        batch_documents.append(doc)
+
+                    if new_ids:
+                        pdf_chunk_map[clean_filename] = pdf_chunk_map.get(clean_filename, []) + new_ids
                 
-                clean_filename = os.path.basename(pdf_full_path)
+                except Exception as e:
+                    logger.error(f"Failed to process PDF {pdf_full_path}: {e}")
+                    errors.append(f"{pdf_full_path}: {str(e)}")
+                    continue 
+
+            # --- Add Batch to FAISS ---
+            if batch_documents:
+                if store is None:
+                    # Initialize store with first batch
+                    store = FAISS.from_documents(batch_documents, embedding=embeddings)
+                    logger.info(f"FAISS initialized with {len(batch_documents)} chunks (Batch {i//BATCH_SIZE + 1}).")
+                else:
+                    # Append to existing store
+                    store.add_documents(batch_documents)
+                    logger.info(f"Added {len(batch_documents)} chunks to FAISS (Batch {i//BATCH_SIZE + 1}).")
                 
-                texts, metadatas = _chunk_and_metadata_from_pdf_bytes(clean_filename, stream)
+                chunks_added_total += len(batch_documents)
+            else:
+                logger.info(f"Batch {i//BATCH_SIZE + 1} produced no new chunks (duplicates or empty).")
 
-                new_ids = []
-                for i, (t, m) in enumerate(zip(texts, metadatas)):
-                    uid = f"{clean_filename}_{i}"
-                    # Skip duplicates
-                    if uid in existing_ids or not t.strip():
-                        continue
-                    existing_ids.add(uid)
-                    new_ids.append(uid)
-                    doc = Document(page_content=t, metadata=m, id=uid)
-                    documents_to_add.append(doc)
+        # --- END OF BATCH LOOP ---
 
-                if new_ids:
-                    pdf_chunk_map[clean_filename] = pdf_chunk_map.get(clean_filename, []) + new_ids
-
-            except Exception as e:
-                logger.error(f"Failed to process PDF {pdf_full_path}: {e}")
-                errors.append(f"{pdf_full_path}: {str(e)}")
-                continue 
-
-        if not documents_to_add and store is None:
+        if chunks_added_total == 0 and store is None:
             _clear_faiss_store()
             return "EMPTY_STORAGE" # Fallback if everything was corrupt
-
-        # Initialize or add to FAISS
-        if documents_to_add:
-            if store is None:
-                store = FAISS.from_documents(documents_to_add, embedding=embeddings)
-                logger.info("FAISS initialized with %d chunks.", len(documents_to_add))
-            else:
-                store.add_documents(documents_to_add)
-                logger.info("Incrementally added %d new chunks to FAISS.", len(documents_to_add))
-        else:
-            logger.info("No new chunks to add; FAISS store unchanged.")
 
         # Save FAISS locally then upload
         store.save_local(local_dir)
@@ -224,7 +244,7 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
         except Exception as e:
             raise RuntimeError(f"Failed to upload index files to blob: {e}")
 
-        # Rebuild BM25
+        # Rebuild BM25 (Must be done on the FULL corpus)
         try:
             all_docs = list(store.docstore._dict.values())
             if all_docs:
@@ -241,12 +261,13 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
                     }, f)
                 with open(bm25_pickle_path, "rb") as f:
                     upload_blob(f"{INDEX_FOLDER}{BM25_FILE}", f.read())
+                logger.info(f"BM25 Index rebuilt with {len(all_docs)} total chunks.")
         except Exception as e:
             logger.error(f"BM25 rebuild failed: {e}")
 
         save_pdf_chunk_map(pdf_chunk_map)
         
-        result_msg = "FAISS + BM25 updated."
+        result_msg = f"Processed {total_files} files. Added {chunks_added_total} chunks."
         if errors:
             result_msg += f" (Note: {len(errors)} files failed to process)."
         return result_msg
@@ -254,7 +275,7 @@ def rebuild_faiss(new_pdfs: List[str] = None, rebuild_all: bool = False):
     except Exception as e:
         logger.critical(f"Critical error in rebuild_faiss: {e}", exc_info=True)
         raise RuntimeError(f"Index rebuild failed: {e}")
-
+    
 # -------------------------------
 # Delete PDF chunks from FAISS
 # -------------------------------
