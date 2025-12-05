@@ -1,5 +1,5 @@
-# ml/chat_model.py
 from langchain_openai import AzureChatOpenAI
+from functools import lru_cache
 from config import (
     AZURE_CHAT_ENDPOINT,
     AZURE_CHAT_API_KEY,
@@ -7,11 +7,9 @@ from config import (
     AZURE_CHAT_MODEL
 )
 
+@lru_cache(maxsize=1)
 def get_chat_model():
-    """Return Azure ChatGPT model instance."""
-    print("ver : ", AZURE_CHAT_API_VERSION)
-    print("model : ", AZURE_CHAT_MODEL)
-
+    """Return Azure ChatGPT model instance (Cached)."""
     return AzureChatOpenAI(
         api_key=AZURE_CHAT_API_KEY,
         azure_endpoint=AZURE_CHAT_ENDPOINT,

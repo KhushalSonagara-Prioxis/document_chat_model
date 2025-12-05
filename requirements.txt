@@ -5,12 +5,13 @@ python-multipart
 python-dotenv
 langchain-openai
 langchain-community
-langchain-core
-langchain-text-splitters
+langchain
+# langchain-core
+# langchain-text-splitters
 faiss-cpu
 rank-bm25
 PyMuPDF
-numpy
+# numpy
 pydantic
 
 # azure-storage-blob==12.27.1

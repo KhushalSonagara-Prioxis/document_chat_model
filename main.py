@@ -1,16 +1,21 @@
 import os
+import glob
+import shutil
+import tempfile
+import asyncio
+import logging
+import uuid
+from contextlib import asynccontextmanager
+from typing import List
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-import logging
+from fastapi.concurrency import run_in_threadpool # <--- IMPORTANT IMPORT
 from pydantic import BaseModel
-import uuid
-import asyncio
 
 from blob.blob_utils import upload_blob, list_blobs, delete_blob
-# Added _clear_faiss_store to imports to handle full index deletion
-from vectors.index_builder import rebuild_faiss, delete_pdf_from_faiss, load_pdf_chunk_map, save_pdf_chunk_map, _clear_faiss_store
+from vectors.index_builder import rebuild_faiss, delete_pdf_from_faiss, _clear_faiss_store
 from vectors.vector_service import load_faiss, hybrid_search, clear_cache 
 from ml.chat_model import get_chat_model
 from config import MODEL_INPUT_PRICE, MODEL_OUTPUT_PRICE, PDF_FOLDER, INDEX_FOLDER, FAISS_INDEX_FILE, FAISS_STORE_FILE, BM25_FILE, PDF_CHUNK_MAP_FILE
@@ -22,7 +27,45 @@ formatter = logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-app = FastAPI()
+conversation_history = {}  
+faiss_lock = asyncio.Lock()
+
+# -------------------------------
+# Auto-Cleanup Logic
+# -------------------------------
+def _clean_os_temp_junk():
+    temp_dir = tempfile.gettempdir()
+    patterns = ["faiss_load_*", "BlobRegistryFiles*", "tmp*.pdf"]
+    deleted_count = 0
+    
+    for pattern in patterns:
+        search_path = os.path.join(temp_dir, pattern)
+        for path in glob.glob(search_path):
+            try:
+                if "faiss_load_" in path or "BlobRegistryFiles" in path or path.endswith(".pdf"):
+                    if os.path.isdir(path): shutil.rmtree(path)
+                    else: os.remove(path)
+                    deleted_count += 1
+            except Exception: pass
+    return deleted_count
+
+async def run_periodic_cleanup():
+    while True:
+        try:
+            await asyncio.sleep(6 * 3600) # 6 Hours
+            await asyncio.to_thread(_clean_os_temp_junk)
+        except asyncio.CancelledError: break
+        except Exception: await asyncio.sleep(60)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_task = asyncio.create_task(run_periodic_cleanup())
+    yield
+    cleanup_task.cancel()
+    try: await cleanup_task
+    except asyncio.CancelledError: pass
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,19 +75,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-conversation_history = {}  
-faiss_lock = asyncio.Lock()
-
-# -------------------------------
-# Global Exception Handler
-# -------------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Global error occurred: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal Server Error", "details": str(exc)},
-    )
+    logger.error(f"Global error: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"error": "Internal Server Error", "details": str(exc)})
 
 def _format_context(chunks: list) -> str:
     formatted = []
@@ -58,40 +92,8 @@ def _format_context(chunks: list) -> str:
             formatted.append(f"--- Source: {source} | Chunk: {chunk_id} ---\n{c.page_content}")
     return "\n\n".join(formatted)
 
-
 # -------------------------------
-# Upload PDF (single)
-# -------------------------------
-@app.post("/upload")
-async def upload_pdf(file: UploadFile):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Filename missing")
-
-    try:
-        data = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="File is empty")
-        
-        target_path = f"{PDF_FOLDER}{file.filename}"
-        upload_blob(target_path, data)
-
-        async with faiss_lock:
-            # Rebuild index
-            status_msg = rebuild_faiss(new_pdfs=[file.filename])
-            clear_cache() 
-            logger.info("Cache cleared after upload.")
-
-        return {"message": f"Uploaded & indexed '{file.filename}'", "details": status_msg}
-
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error("Error uploading/indexing: %s", e)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
-
-# -------------------------------
-# Upload PDFs (multiple)
+# Upload PDFs (Multiple) - Optimized
 # -------------------------------
 @app.post("/uploads")
 async def upload_pdfs(files: List[UploadFile] = File(...)):
@@ -104,11 +106,13 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
         for file in files:
             data = await file.read()
             target_path = f"{PDF_FOLDER}{file.filename}"
-            upload_blob(target_path, data)
+            # OPTIMIZATION: Run blocking upload in threadpool
+            await run_in_threadpool(upload_blob, target_path, data)
             uploaded_files.append(file.filename)
 
         async with faiss_lock:
-            status_msg = rebuild_faiss(new_pdfs=uploaded_files)
+            # OPTIMIZATION: Run blocking rebuild in threadpool
+            status_msg = await run_in_threadpool(rebuild_faiss, new_pdfs=uploaded_files)
             clear_cache()
 
         return {
@@ -128,13 +132,9 @@ def list_files():
     try:
         full_paths = list_blobs(prefix=PDF_FOLDER)
         filenames = [os.path.basename(path) for path in full_paths if path.lower().endswith(".pdf")]
-        
-        return {
-            "count": len(filenames),
-            "files": filenames
-        }
+        return {"count": len(filenames), "files": filenames}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
 # Delete PDF (Single)
@@ -142,84 +142,62 @@ def list_files():
 @app.delete("/delete/{filename}")
 async def delete_pdf(filename: str):
     try:
-        # 1. Delete blob
         target_path = f"{PDF_FOLDER}{filename}"
-        deleted = delete_blob(target_path)
+        # Run blocking delete in thread
+        deleted = await run_in_threadpool(delete_blob, target_path)
         
         if not deleted:
-            raise HTTPException(status_code=404, detail=f"File {filename} not found in storage.")
+            raise HTTPException(status_code=404, detail="File not found")
 
         async with faiss_lock:
-            # 2. Delete from FAISS
-            delete_pdf_from_faiss(filename)
-
+            await run_in_threadpool(delete_pdf_from_faiss, filename)
             clear_cache()
 
-            # 3. Check if empty
-            remaining_pdfs = [b for b in list_blobs(prefix=PDF_FOLDER) if b.lower().endswith(".pdf")]
+            remaining_pdfs = await run_in_threadpool(list_blobs, prefix=PDF_FOLDER)
+            pdf_count = len([b for b in remaining_pdfs if b.lower().endswith(".pdf")])
             
-            if not remaining_pdfs:
-                logger.info("No PDFs remaining; cleaning up Index.")
+            if pdf_count == 0:
                 _clear_faiss_store()
                 clear_cache()
 
-        return {"message": f"Deleted '{filename}' successfully."}
-
-    except HTTPException as he:
-        raise he
+        return {"message": f"Deleted '{filename}'"}
+    except HTTPException as he: raise he
     except Exception as e:
-        logger.error("Error deleting PDF: %s", e)
+        logger.error("Error deleting: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # -------------------------------
 # Delete ALL Files (Reset)
 # -------------------------------
 @app.delete("/delete-all")
 async def delete_all_files():
-    """
-    Deletes ALL PDFs and wipes the Vector Index and Cache completely.
-    """
     try:
         deleted_count = 0
+        all_pdfs = await run_in_threadpool(list_blobs, prefix=PDF_FOLDER)
         
-        # 1. List all PDFs in the PDF folder
-        all_pdfs = list_blobs(prefix=PDF_FOLDER)
-        
-        # 2. Delete each PDF blob
         for pdf_path in all_pdfs:
             try:
-                delete_blob(pdf_path)
+                await run_in_threadpool(delete_blob, pdf_path)
                 deleted_count += 1
-            except Exception as e:
-                logger.warning(f"Failed to delete individual blob {pdf_path}: {e}")
+            except Exception: pass
 
         async with faiss_lock:
-            # 3. Wipe the FAISS/BM25 Index and Chunk Map from Blob Storage & Local Temp
-            # This function (imported from index_builder) handles all index files cleanup
             _clear_faiss_store()
-            
-            # 4. Clear In-Memory Cache
             clear_cache()
-            
-            # 5. Clear Chat History (optional, but logical since knowledge is gone)
             conversation_history.clear()
 
-        logger.info(f"System Reset: Deleted {deleted_count} documents and cleared indices.")
+        junk_deleted = await run_in_threadpool(_clean_os_temp_junk)
         
         return {
             "message": "System reset successful.",
             "details": {
-                "deleted_files_count": deleted_count,
-                "index_status": "Cleared",
-                "cache_status": "Cleared"
+                "deleted_files": deleted_count,
+                "cleaned_temp": junk_deleted
             }
         }
-
     except Exception as e:
-        logger.error("Critical error in delete-all: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"System reset failed: {str(e)}")
-
+        logger.error("Reset error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
 # Ask Endpoint
@@ -228,69 +206,43 @@ class AskRequest(BaseModel):
     query: str
     chat_id: str | None = None
 
-
 @app.post("/ask")
 async def ask(body: AskRequest):
     if not body.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    query = body.query
     chat_id = body.chat_id or str(uuid.uuid4())
 
     try:
-        store = load_faiss()
+        # OPTIMIZATION: Load index in threadpool
+        store = await run_in_threadpool(load_faiss)
         
-        # --- Handle Missing Index / First Run ---
         if not store:
-            logger.info("Index not found in memory or storage. Attempting auto-recovery.")
             async with faiss_lock:
                 try:
-                    # rebuild_faiss will check for PDFs inside the function
-                    rebuild_msg = rebuild_faiss()
-                    
-                    if "EMPTY_STORAGE" in rebuild_msg or "Index cleared" in rebuild_msg:
-                        # CASE: Index missing AND No PDFs in Blob -> Clean 404
-                        logger.warning("Auto-recovery failed: No documents found in storage.")
-                        return JSONResponse(
-                            status_code=404, 
-                            content={
-                                "answer": "I don't have any documents to reference. Please upload a PDF first.", 
-                                "chat_id": chat_id,
-                                "error_code": "NO_DOCUMENTS"
-                            }
-                        )
-                    
-                    # CASE: Index was missing, but PDFs existed -> Rebuilt -> Load again
-                    store = load_faiss()
-                except Exception as e:
-                    logger.error("Auto-recovery critical failure: %s", e)
-                    raise HTTPException(status_code=500, detail="Knowledge base unavailable and recovery failed.")
+                    rebuild_msg = await run_in_threadpool(rebuild_faiss)
+                    if "EMPTY_STORAGE" in rebuild_msg:
+                        return JSONResponse(status_code=404, content={"answer": "Please upload a PDF first.", "chat_id": chat_id, "error_code": "NO_DOCUMENTS"})
+                    store = await run_in_threadpool(load_faiss)
+                except Exception:
+                    raise HTTPException(status_code=500, detail="Knowledge base unavailable.")
 
-        if not store:
-             # If still None after recovery attempt, something is technically wrong
-             raise HTTPException(status_code=500, detail="Failed to load knowledge base.")
+        if not store: raise HTTPException(status_code=500, detail="Failed to load KB.")
 
-        # --- Search & Generate ---
-        history = conversation_history.get(chat_id, []) if chat_id else []
-        history_text = "\n\n".join(
-            [f"USER: {turn['user']}\nASSISTANT: {turn['assistant']}" for turn in history]
-        ) if history else "(No previous history)"
+        history = conversation_history.get(chat_id, [])
+        history_text = "\n\n".join([f"USER: {t['user']}\nASSISTANT: {t['assistant']}" for t in history])
 
-        k = 10 if "calculate" in query.lower() or "combine" in query.lower() else 4
-        chunks = hybrid_search(store, query, k=k)
+        # Search in threadpool
+        k = 10 if "calculate" in body.query.lower() or "combine" in body.query.lower() else 4
+        chunks = await run_in_threadpool(hybrid_search, store, body.query, k=k)
         
         if not chunks:
-            return {
-                "answer": "I couldn't find any information relevant to your query in the uploaded documents.",
-                "chat_id": chat_id,
-                "metadata": {}
-            }
+            return {"answer": "No relevant info found.", "chat_id": chat_id}
             
         context = _format_context(chunks)
 
         prompt = f"""
 You are an expert insurance analyst. Use ONLY the provided context and history.
-
 Instructions:
 1. **Deep Analysis:** The answer is likely contained in the **Context** below, but it may be fragmented or inside a complex table.
 2. **Connect the Dots:** If the user asks about a specific rule (e.g., "Age 70"), look for related keywords like "Senior," "Elderly," or "Limit" even if the exact phrase is missing.
@@ -319,46 +271,25 @@ CONTEXT
 ==========================
 QUESTION
 ==========================
-{query}
+{body.query}
 """
-
         llm = get_chat_model()
-        response = llm.invoke(prompt)
+        response = await llm.ainvoke(prompt) # Use Async invoke for LLM
 
-        if chat_id not in conversation_history:
-            conversation_history[chat_id] = []
-        conversation_history[chat_id].append({
-            "user": query,
-            "assistant": response.content
-        })
+        if chat_id not in conversation_history: conversation_history[chat_id] = []
+        conversation_history[chat_id].append({"user": body.query, "assistant": response.content})
 
-        # Calculate Metadata/Cost
-        metadata = response.response_metadata or {}
-        token_usage = metadata.get("token_usage", {})
-        prompt_tokens = token_usage.get("prompt_tokens", 0)
-        completion_tokens = token_usage.get("completion_tokens", 0)
-        total_tokens = token_usage.get("total_tokens", 0)
-        model_name = metadata.get("model_name", "unknown")
-
-        cost_in = (prompt_tokens / 1_000_000) * MODEL_INPUT_PRICE if MODEL_INPUT_PRICE else None
-        cost_out = (completion_tokens / 1_000_000) * MODEL_OUTPUT_PRICE if MODEL_OUTPUT_PRICE else None
-        total_cost = (cost_in + cost_out) if cost_in and cost_out else None
-
+        # Metadata processing...
+        meta = response.response_metadata or {}
+        token_usage = meta.get("token_usage", {})
+        
         return {
             "answer": response.content,
             "chat_id": chat_id,
-            "history_length": len(conversation_history.get(chat_id, [])),
-            "metadata": {
-                "model_used": model_name,
-                "token_usage": token_usage,
-                "cost_estimate_usd": {
-                    "total_cost": total_cost,
-                },
-            }
+            "metadata": {"model_used": meta.get("model_name"), "token_usage": token_usage}
         }
         
-    except HTTPException as he:
-        raise he
+    except HTTPException as he: raise he
     except Exception as e:
-        logger.error("Error in /ask endpoint: %s", e, exc_info=True)
+        logger.error("Ask error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

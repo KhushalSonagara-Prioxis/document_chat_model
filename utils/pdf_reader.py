@@ -7,14 +7,19 @@ logger = logging.getLogger(__name__)
 
 def clean_text(text: str) -> str:
     """
-    Clean extracted PDF text.
+    Clean extracted PDF text:
+    - Remove multiple spaces
+    - Remove non-printable characters
     """
     if not text:
         return ""
-    # Normalize whitespace
+    
+    # Normalize whitespace (tabs, newlines -> single space)
     text = re.sub(r'\s+', ' ', text)
+    
     # Remove non-printable characters
     text = ''.join(c for c in text if c.isprintable())
+    
     return text.strip()
 
 def read_pdf_text(path: str) -> str:
